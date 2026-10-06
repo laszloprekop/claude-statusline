@@ -11,6 +11,13 @@ plain() {
     | sed $'s/\x1b\\[[0-9;]*m//g' | LC_ALL=C sed $'s/\xee[\x80-\xbf][\x80-\xbf]//g; s/\xef[\x80-\xa3][\x80-\xbf]//g' \
     | tr -s ' ' | sed 's/^ //; s/ $//'
 }
+# tagged <json> <now>: as plain, but yellow and red text is kept as <Y>...</> and <R>...</>
+tagged() {
+  echo "$1" | STATUSLINE_STATE="$STATE" STATUSLINE_NOW="$2" bash statusline.sh \
+    | sed $'s/\x1b\\[33m/<Y>/g; s/\x1b\\[31m/<R>/g; s/\x1b\\[0m/<\\/>/g; s/\x1b\\[[0-9;]*m//g' \
+    | LC_ALL=C sed $'s/\xee[\x80-\xbf][\x80-\xbf]//g; s/\xef[\x80-\xa3][\x80-\xbf]//g' \
+    | tr -s ' ' | sed 's/^ //; s/ $//'
+}
 check() { # check <name> <actual> <expected substring>
   case "$2" in
     *"$3"*) echo "ok   $1" ;;
@@ -38,17 +45,35 @@ check "context bar and session time" "$OUT" "████░░░░░░ 42%"
 check "session time over an hour" "$OUT" "1h 02m"
 OUT=$(plain "$(json b p1 5 6)" $T)
 check "before calibration: account average" "$OUT" "3.0%/h …"
-check "limits" "$OUT" "6% $(date -r $RESET +%H:%M 2>/dev/null || date -d @$RESET +%H:%M) 91%"
+check "limits, with the time left until the reset" "$OUT" "6% 3h 00m 91%"
+check "a limit over 90% is red" "$(tagged "$(json b p1 5 6)" $T)" "<R>91%</>"
 for c in 5.50 5.48 5.52 5.49; do plain "$(json b p1 $c 6)" $((T + 60)) >/dev/null; done
 check "small dips in the total are ignored" "$(cut -f4 "$STATE/sessions/b" | head -1)" "0.520000"
 OUT=$(plain "$(json b p1 6 8)" $((T + 300)))
 check "two points gained: rough burn rate and turn" "$OUT" "~12%/h ~2.0%"
 OUT=$(plain "$(json b p2 6.5 11)" $((T + 360)))
 check "five points gained, new prompt" "$OUT" "30%/h 1.7%"
+OUT=$(tagged "$(json b p2 6.5 11)" $((T + 360)))
+check "very high burn rate is red, a normal turn is plain" "$OUT" "<R>30%</>/h</> </> 1.7%"
 plain "$(json b p3 0.30 11)" $((T + 400)) >/dev/null
 check "a drop to near zero counts as a reset" "$(cut -f4 "$STATE/sessions/b" | head -1)" "1.800000"
 OUT=$(plain "$(json a p1 0 "" ',"prompt_cache":{"caching_observed":true,"warm":false,"recache_tokens_if_cold":152020}')" $T)
 check "cold cache shows the re-store size" "$OUT" "152k"
+OUT=$(plain "$(json a p1 0 "" ',"prompt_cache":{"caching_observed":true,"warm":true,"expires_at":'$((T + 2880))'}')" $T)
+check "warm cache shows the time left" "$OUT" "48m"
+OUT=$(tagged '{"model":{"id":"claude-fable-5-1","display_name":"Fable 5.1"},"workspace":{"current_dir":"/"}}' $T)
+check "a heavy model's weight is red" "$OUT" "<R>10x</>"
+
+# --- paid tokens
+OUT=$(plain "$(json c p1 1 "")" $T)
+plain "$(json c p1 1.20 "")" $((T + 300)) >/dev/null
+OUT=$(tagged "$(json c p2 1.80 "")" $((T + 360)))
+check "no limit sent: dollars, the high turn is yellow" "$OUT" "\$4.80/h</> </> <Y>\$0.60</> Σ \$1.80"
+check "a learned factor is not used for paid tokens" "$(cat "$STATE/factor") $OUT" "$RESET Opus"
+OUT=$(plain "$(json d p1 3 100)" $T)
+check "limit used up: dollars" "$OUT" "\$0.00/h \$0.00 Σ \$3.00"
+OUT=$(plain "$(json a p1 0 "" ',"rate_limits":{"spend_limit":{"used_percentage":63,"used_usd":314.12,"limit_usd":500}}')" $T)
+check "gateway spend limit" "$OUT" "\$ \$314/\$500"
 
 [ "$FAILED" = 0 ] && echo "all passed"
 exit $FAILED

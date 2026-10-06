@@ -2,9 +2,10 @@
 # Claude Code status line: https://github.com/laszloprekop/claude-statusline
 # Two lines, grown from the multi-line example in https://code.claude.com/docs/en/statusline
 #   Model 4x ▂▄▅▇█     dir    branch +staged ~modified    #n state
-#   ████░░░░░░ 42%    15%/h  0.3%  35%    24m    38%  21:40    12%    21:05
+#   ████░░░░░░ 42%    15%/h  0.3%  35%    24m    38%  2h 14m    12%    48m
 # Icons are Nerd Font glyphs (Ghostty has them built in), not emoji. Groups are separated
 # by white space only. Every part after the folder is left out when its data is missing.
+# The two times count down; set "refreshInterval" in the statusLine setting to keep them moving.
 
 input=$(cat)
 
@@ -12,7 +13,8 @@ input=$(cat)
 IFS=$'\x1f' read -r MODEL DIR PCT DURATION_MS EFFORT FAST \
   FIVE_H FIVE_H_RESET WEEK PR_NUM PR_STATE PR_KIND \
   CACHE_SEEN CACHE_WARM CACHE_EXPIRES TRANSCRIPT \
-  COST SESSION PROMPT CACHE_TTL RECACHE MODEL_ID < <(echo "$input" | jq -r '[
+  COST SESSION PROMPT CACHE_TTL RECACHE MODEL_ID \
+  SPEND_PCT SPEND_USD SPEND_MAX < <(echo "$input" | jq -r '[
     .model.display_name // "Claude",
     .workspace.current_dir // .cwd // "",
     (.context_window.used_percentage // 0 | floor),
@@ -34,7 +36,10 @@ IFS=$'\x1f' read -r MODEL DIR PCT DURATION_MS EFFORT FAST \
     .prompt_id // "",
     .prompt_cache.ttl // "",
     (.prompt_cache.recache_tokens_if_cold // "" | if . == "" then . else floor end),
-    .model.id // ""
+    .model.id // "",
+    (.rate_limits.spend_limit.used_percentage // "" | if . == "" then . else round end),
+    (.rate_limits.spend_limit.used_usd // "" | if . == "" then . else round end),
+    (.rate_limits.spend_limit.limit_usd // "" | if . == "" then . else round end)
   ] | map(tostring) | join("\u001f")')
 [ -n "$PCT" ] || PCT=0
 [ -n "$DURATION_MS" ] || DURATION_MS=0
@@ -45,14 +50,26 @@ RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'
 MAGENTA='\033[35m'; CYAN='\033[36m'; DIM='\033[2m'; RESET='\033[0m'
 SEP='   '
 
-# epoch seconds as local HH:MM (BSD date on macOS, GNU date on Linux)
-clock() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M; }
+# time left until epoch seconds, as "2h 05m", "48m" or "<1m"
+left() {
+  local s=$(($1 - NOW))
+  if [ "$s" -ge 3600 ]; then printf '%dh %02dm' $((s / 3600)) $((s % 3600 / 60))
+  elif [ "$s" -ge 60 ]; then printf '%dm' $((s / 60))
+  else printf '<1m'; fi
+}
 
-# green under 70%, yellow 70-89%, red from 90%
-level_color() {
-  if [ "$1" -ge 90 ]; then printf '%s' "$RED"
-  elif [ "$1" -ge 70 ]; then printf '%s' "$YELLOW"
-  else printf '%s' "$GREEN"; fi
+# Levels: 0 normal, 1 high, 2 very high. A normal number keeps the plain text color, so
+# only the ones that need attention stand out; icons and bars are green when normal.
+level() { # level <value> <high from> <very high from>
+  if [ "$1" -ge "$3" ]; then echo 2; elif [ "$1" -ge "$2" ]; then echo 1; else echo 0; fi
+}
+paint() { # paint <level> <text>
+  case "$1" in
+    2) printf '%s' "${RED}$2${RESET}" ;; 1) printf '%s' "${YELLOW}$2${RESET}" ;; *) printf '%s' "$2" ;;
+  esac
+}
+icon_color() { # icon_color <level>
+  case "$1" in 2) printf '%s' "$RED" ;; 1) printf '%s' "$YELLOW" ;; *) printf '%s' "$GREEN" ;; esac
 }
 
 # --- line 1 ---------------------------------------------------------------
@@ -79,7 +96,8 @@ esac
 
 STEPS=(▂ ▄ ▅ ▇ █)
 HEAD="${CYAN}${MODEL}${RESET}"
-[ -n "$WEIGHT" ] && HEAD="$HEAD ${YELLOW}${WEIGHT}x${RESET}"
+# the weight is a lever too: high from 3x, very high from 8x
+[ -n "$WEIGHT" ] && HEAD="$HEAD $(paint "$(level "$WEIGHT" 3 8)" "${WEIGHT}x")"
 if [ "$LIT" -gt 0 ]; then
   ON=""; OFF=""
   for i in 0 1 2 3 4; do
@@ -120,12 +138,7 @@ echo -e "$LINE1"
 
 # --- line 2 ---------------------------------------------------------------
 
-FILLED=$((PCT / 10)); [ "$FILLED" -gt 10 ] && FILLED=10
-EMPTY=$((10 - FILLED))
-printf -v FILL "%${FILLED}s"; printf -v PAD "%${EMPTY}s"
-LINE2="$(level_color "$PCT")${FILL// /█}${DIM}${PAD// /░}${RESET} ${PCT}%"
-
-# Budget burn: how fast this session uses the 5-hour limit, and what the current turn took.
+# Budget burn: how fast this session spends, and what the current turn took.
 #    15%/h   this session's last 10 minutes, as percent of the 5-hour budget per hour
 #    0.3%    the current turn (since the last prompt), as percent of that budget
 # Claude Code only sends the limit as a whole percent for the whole account, so the script
@@ -133,6 +146,14 @@ LINE2="$(level_color "$PCT")${FILL// /█}${DIM}${PAD// /░}${RESET} ${PCT}%"
 # machine spent while the percentage rose. A "~" marks a still rough value, "…" none yet.
 # State: sessions/<id> (line 1: prompt, turn base, last total, running sum; then "time sum"
 # samples), window (reset time, percent and machine sum at first sight), factor ($ per 1%).
+#
+# Paid tokens: no 5-hour limit is sent (API key, Bedrock, Vertex, a gateway), or it is used
+# up and a subscriber goes on with extra usage. A percent of the budget means nothing then,
+# so the same two figures are shown in dollars, with the session total after them:
+#    $3.20/h   $0.42  Σ $4.10
+PAID=""
+if [ -z "$FIVE_H" ] || [ "$FIVE_H" -ge 100 ]; then PAID=1; fi
+BURN=""; TURN_LVL=0
 if [ -n "$SESSION" ]; then
   SD="${STATUSLINE_STATE:-$HOME/.claude/statusline-state}"; SF="$SD/sessions/$SESSION"
   mkdir -p "$SD/sessions" 2>/dev/null
@@ -158,7 +179,7 @@ if [ -n "$SESSION" ]; then
 
   F_USD=""; F_PCT=""; F_RESET=""
   [ -r "$SD/factor" ] && read -r F_USD F_PCT F_RESET < "$SD/factor"
-  if [ -n "$FIVE_H" ] && [ -n "$FIVE_H_RESET" ]; then
+  if [ -z "$PAID" ] && [ -n "$FIVE_H_RESET" ]; then
     SPENT=$(awk -F'\t' 'FNR == 1 { s += $4 } END { printf "%.6f", s }' "$SD"/sessions/* 2>/dev/null)
     W_RESET=""; W_PCT=""; W_SPENT=""
     [ -r "$SD/window" ] && read -r W_RESET W_PCT W_SPENT < "$SD/window"
@@ -187,26 +208,34 @@ if [ -n "$SESSION" ]; then
     fi
   fi
 
-  if [ -n "$F_USD" ]; then
-    read -r RATE_FMT RATE_INT TURN_FMT < <(awk -v t="$TURN_USD" -v w="$WIN_USD" -v f="$F_USD" 'BEGIN {
-      r = w * 6 / f; p = t / f
-      printf (r < 10 ? "%.1f" : "%.0f"), r; printf " %d ", r; printf (p < 10 ? "%.1f" : "%.0f"), p }')
-    # 20%/h empties a full 5-hour budget within the window
-    if [ "$RATE_INT" -ge 20 ]; then FIRE_COLOR="$RED"
-    elif [ "$RATE_INT" -ge 10 ]; then FIRE_COLOR="$YELLOW"
-    elif [ "$RATE_FMT" = "0.0" ]; then FIRE_COLOR="$DIM"
-    else FIRE_COLOR="$GREEN"; fi
+  if [ -n "$PAID" ]; then
+    # dollars at list price: the last 10 minutes as a rate per hour, the turn, the session
+    read -r RATE_FMT RATE_LVL TURN_FMT TURN_LVL TOTAL_FMT < <(awk -v t="$TURN_USD" -v w="$WIN_USD" \
+      -v c="$COST" -v hl="${STATUSLINE_USD_HOUR:-5 15}" -v tl="${STATUSLINE_USD_TURN:-0.5 2}" '
+      function lvl(v, lim,   a) { split(lim, a, " "); return v >= a[2] ? 2 : v >= a[1] ? 1 : 0 }
+      function usd(v) { return sprintf(v < 100 ? "%.2f" : "%.0f", v) }
+      BEGIN { r = w * 6; print usd(r), lvl(r, hl), usd(t), lvl(t, tl), usd(c) }')
+    if [ "$RATE_FMT" = "0.00" ]; then FIRE_COLOR="$DIM"; else FIRE_COLOR=$(icon_color "$RATE_LVL"); fi
+    BURN="${SEP}${FIRE_COLOR}${RESET} $(paint "$RATE_LVL" "\$${RATE_FMT}")${DIM}/h${RESET} ${CYAN}${RESET} $(paint "$TURN_LVL" "\$${TURN_FMT}") ${DIM}Σ \$${TOTAL_FMT}${RESET}"
+  elif [ -n "$F_USD" ]; then
+    # percent of the own budget, so the same turn weighs more on a smaller plan. 20%/h
+    # empties a full 5-hour budget within the window; a 5% turn leaves room for 20 of them
+    read -r RATE_FMT RATE_LVL TURN_FMT TURN_LVL < <(awk -v t="$TURN_USD" -v w="$WIN_USD" -v f="$F_USD" '
+      function lvl(v, hi, top) { return v >= top ? 2 : v >= hi ? 1 : 0 }
+      function pct(v) { return sprintf(v < 10 ? "%.1f" : "%.0f", v) }
+      BEGIN { r = w * 6 / f; p = t / f; print pct(r), lvl(r, 10, 20), pct(p), lvl(p, 2, 5) }')
+    if [ "$RATE_FMT" = "0.0" ]; then FIRE_COLOR="$DIM"; else FIRE_COLOR=$(icon_color "$RATE_LVL"); fi
     ROUGH=""; [ "$F_PCT" -lt 5 ] && ROUGH="~"
-    LINE2="$LINE2${SEP}${FIRE_COLOR}${RESET} ${ROUGH}${RATE_FMT}%${DIM}/h${RESET} ${CYAN}${RESET} ${ROUGH}${TURN_FMT}%"
-  elif [ -n "$FIVE_H" ] && [ -n "$FIVE_H_RESET" ]; then
+    BURN="${SEP}${FIRE_COLOR}${RESET} $(paint "$RATE_LVL" "${ROUGH}${RATE_FMT}%")${DIM}/h${RESET} ${CYAN}${RESET} $(paint "$TURN_LVL" "${ROUGH}${TURN_FMT}%")"
+  elif [ -n "$FIVE_H_RESET" ]; then
     # nothing learned yet: the whole account's average over this window so far, faded,
     # with "…" to say the per-session figure is still being learned
     AVG=$(awk -v u="$FIVE_H" -v reset="$FIVE_H_RESET" -v now="$NOW" 'BEGIN {
       h = (now - (reset - 18000)) / 3600; if (h < 0.1) h = 0.1
       r = u / h; printf (r < 10 ? "%.1f" : "%.0f"), r }')
-    LINE2="$LINE2${SEP}${DIM} ${AVG}%/h …${RESET}"
+    BURN="${SEP}${DIM} ${AVG}%/h …${RESET}"
   else
-    LINE2="$LINE2${SEP}${DIM} …${RESET}"
+    BURN="${SEP}${DIM} …${RESET}"
   fi
 fi
 
@@ -227,10 +256,21 @@ if [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ]; then
     | (map((.input_tokens // 0) + (.cache_creation_input_tokens // 0) * $w
         + (.cache_read_input_tokens // 0) * $r) | add // 0) as $ctx
     | if $out + $ctx > 0 then ($out * 100 / ($out + $ctx) | round) else empty end' 2>/dev/null)
-  if [ -n "$OUT_PCT" ]; then
-    LINE2="$LINE2 ${MAGENTA}${RESET} ${OUT_PCT}%"
-  fi
 fi
+
+# The turn's level goes to the part that caused most of the turn: the output share when
+# output is half or more (lower the effort), otherwise the context percent (/compact or
+# /clear). The bar itself keeps showing only how full the window is.
+CTX_LVL=$(level "$PCT" 70 90); NUM_LVL=$CTX_LVL; OUT_LVL=0
+if [ -n "$OUT_PCT" ]; then
+  if [ "$OUT_PCT" -ge 50 ]; then OUT_LVL=$TURN_LVL
+  elif [ "$TURN_LVL" -gt "$NUM_LVL" ]; then NUM_LVL=$TURN_LVL; fi
+fi
+FILLED=$((PCT / 10)); [ "$FILLED" -gt 10 ] && FILLED=10
+EMPTY=$((10 - FILLED))
+printf -v FILL "%${FILLED}s"; printf -v PAD "%${EMPTY}s"
+LINE2="$(icon_color "$CTX_LVL")${FILL// /█}${DIM}${PAD// /░}${RESET} $(paint "$NUM_LVL" "${PCT}%")$BURN"
+[ -n "$OUT_PCT" ] && LINE2="$LINE2 ${MAGENTA}${RESET} $(paint "$OUT_LVL" "${OUT_PCT}%")"
 
 # Session time
 MINS=$((DURATION_MS / 60000))
@@ -239,18 +279,29 @@ elif [ "$MINS" -ge 1 ]; then TIME_FMT="${MINS}m"
 else TIME_FMT="$((DURATION_MS / 1000))s"; fi
 LINE2="$LINE2${SEP}${CYAN}${RESET} $TIME_FMT"
 
-# Usage limits (hourglass: 5-hour window, calendar: 7-day window): only sent to
-# claude.ai subscribers, after the first response
+# Usage limits (hourglass: 5-hour window with the time left until it resets, calendar: 7-day
+# window): only sent to claude.ai subscribers, after the first response
 if [ -n "$FIVE_H" ]; then
-  LINE2="$LINE2${SEP}$(level_color "$FIVE_H")${RESET} ${FIVE_H}%"
-  [ -n "$FIVE_H_RESET" ] && LINE2="$LINE2 ${DIM} $(clock "$FIVE_H_RESET")${RESET}"
+  LVL=$(level "$FIVE_H" 70 90)
+  LINE2="$LINE2${SEP}$(icon_color "$LVL")${RESET} $(paint "$LVL" "${FIVE_H}%")"
+  [ -n "$FIVE_H_RESET" ] && LINE2="$LINE2 ${DIM} $(left "$FIVE_H_RESET")${RESET}"
 fi
-[ -n "$WEEK" ] && LINE2="$LINE2${SEP}$(level_color "$WEEK")${RESET} ${WEEK}%"
+if [ -n "$WEEK" ]; then
+  LVL=$(level "$WEEK" 70 90)
+  LINE2="$LINE2${SEP}$(icon_color "$LVL")${RESET} $(paint "$LVL" "${WEEK}%")"
+fi
+# Spend limit: set by a Claude apps gateway, in dollars once the gateway has sent them
+if [ -n "$SPEND_PCT$SPEND_USD" ]; then
+  LVL=$(level "${SPEND_PCT:-0}" 70 90)
+  if [ -n "$SPEND_USD" ] && [ -n "$SPEND_MAX" ]; then SPEND_FMT="\$${SPEND_USD}/\$${SPEND_MAX}"
+  else SPEND_FMT="${SPEND_PCT}%"; fi
+  LINE2="$LINE2${SEP}$(icon_color "$LVL")\$${RESET} $(paint "$LVL" "$SPEND_FMT")"
+fi
 
-# Prompt cache: the time it goes cold, or a snowflake and the re-store size once it has
+# Prompt cache: the time left until it goes cold, or a snowflake and the re-store size once it has
 if [ "$CACHE_SEEN" = "true" ]; then
   if [ "$CACHE_WARM" = "true" ] && [ -n "$CACHE_EXPIRES" ] && [ "$CACHE_EXPIRES" -gt "$NOW" ]; then
-    LINE2="$LINE2${SEP}${DIM} $(clock "$CACHE_EXPIRES")${RESET}"
+    LINE2="$LINE2${SEP}${DIM} $(left "$CACHE_EXPIRES")${RESET}"
   else
     # cold: the tokens the next message has to store again
     if [ -n "$RECACHE" ] && [ "$RECACHE" -ge 1000 ]; then COLD_FMT="$(( (RECACHE + 500) / 1000 ))k"

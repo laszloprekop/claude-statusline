@@ -16,7 +16,7 @@ curl -fsSL "$URL" -o "$DEST/statusline.sh"
 chmod +x "$DEST/statusline.sh"
 
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-NEW=$(jq --arg cmd "bash $DEST/statusline.sh" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS") || {
+NEW=$(jq --arg cmd "bash $DEST/statusline.sh" '.statusLine = {type: "command", command: $cmd, refreshInterval: 30}' "$SETTINGS") || {
   echo "Could not read $SETTINGS as JSON. Nothing was changed in it." >&2; exit 1; }
 cp "$SETTINGS" "$SETTINGS.bak-statusline"
 printf '%s\n' "$NEW" > "$SETTINGS"
